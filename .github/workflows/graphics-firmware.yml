@@ -1,0 +1,162 @@
+name: Core Ultra graphics and firmware validation
+
+on:
+  push:
+    branches: [graphics-firmware-build]
+  pull_request:
+    paths:
+      - 'CoreUltraGraphicsDriver.*'
+      - 'XeTranslationPipeline.*'
+      - 'kmod_info.c'
+      - 'Makefile'
+      - 'port/**'
+      - 'tests/**'
+      - 'research/**'
+      - 'verify_kext.py'
+      - 'test_verify_kext.py'
+      - '.github/workflows/graphics-firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graphics-firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware-inspection:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned firmware inspection tools in runner workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-results
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev libfreetype6-dev libbz2-dev liblzma-dev pkg-config
+          cargo install binwalk --version 3.1.0 --locked --root "$RUNNER_TEMP/binwalk"
+          npm install --prefix "$RUNNER_TEMP/rea" --ignore-scripts --no-audit --no-fund rea-agents@6.5.0
+          cp "$RUNNER_TEMP/rea/package-lock.json" ci-results/rea-package-lock.json
+          {
+            uname -a
+            node --version
+            "$RUNNER_TEMP/rea/node_modules/.bin/rea" --version
+            "$RUNNER_TEMP/binwalk/bin/binwalk" --version
+            command -v ps
+            command -v prlimit
+          } 2>&1 | tee ci-results/inspection-environment.txt
+      - name: Fetch matching unmodified firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/tools/fetch_mtl_firmware.py 2>&1 | tee ci-results/firmware-fetch.txt
+          cp research/firmware/38c1a7096dfb/manifest.json ci-results/firmware-manifest.json
+          cp research/firmware/38c1a7096dfb/LICENSE.i915 ci-results/LICENSE.i915
+      - name: Inspect firmware through REA and preserve complete evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          export REA_BINWALK_COMMAND="$RUNNER_TEMP/binwalk/bin/binwalk"
+          for image in mtl_guc_70.bin mtl_huc_gsc.bin mtl_gsc_1.bin; do
+            "$RUNNER_TEMP/rea/node_modules/.bin/rea" inspect-firmware-regions \
+              "$PWD/research/firmware/38c1a7096dfb/$image" --json \
+              > "ci-results/$image.rea.json" 2> "ci-results/$image.rea.stderr.txt"
+          done
+          echo 'REA signature inspection completed; this is not instruction decompilation.'
+      - name: Retain firmware inspection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MTL-firmware-REA-${{ github.sha }}
+          path: ci-results/
+          if-no-files-found: error
+          retention-days: 14
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch pinned kernel SDK
+        uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          path: .deps/MacKernelSDK
+          persist-credentials: false
+      - name: Record toolchain and source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-results
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-path
+            xcrun clang++ --version
+            git rev-parse HEAD
+            git -C .deps/MacKernelSDK rev-parse HEAD
+          } 2>&1 | tee ci-results/environment.txt
+      - name: Fetch and verify matching firmware reference files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/tools/fetch_mtl_firmware.py 2>&1 | tee ci-results/firmware-fetch.txt
+          cp research/firmware/38c1a7096dfb/manifest.json ci-results/firmware-manifest.json
+          cp research/firmware/38c1a7096dfb/LICENSE.i915 ci-results/LICENSE.i915
+      - name: Run Python format and trace decoder checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest test_verify_kext -v 2>&1 | tee ci-results/bundle-tests.txt
+          (cd research && python3 -m unittest discover -s tests -v) 2>&1 | tee ci-results/firmware-tests.txt
+      - name: Compile and execute portable protocol tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_c_batch.c -o ci-results/test-mi-batch
+            ci-results/test-mi-batch
+            clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_guc_protocol.c -o ci-results/test-guc-protocol
+            ci-results/test-guc-protocol
+            clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_mmio_probe.c -o ci-results/test-mmio-probe
+            ci-results/test-mmio-probe
+            echo 'All three C tests passed with AddressSanitizer and UndefinedBehaviorSanitizer.'
+          } 2>&1 | tee ci-results/protocol-tests.txt
+      - name: Build graphics diagnostic kext
+        shell: bash
+        run: |
+          set -euo pipefail
+          make KERNEL_SDK="$PWD/.deps/MacKernelSDK" 2>&1 | tee ci-results/build.txt
+      - name: Verify and package kext
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            python3 verify_kext.py CoreUltraGraphics.kext
+            nm -gU build/CoreUltraGraphics
+            nm -u build/CoreUltraGraphics
+            otool -hv build/CoreUltraGraphics
+            shasum -a 256 build/CoreUltraGraphics
+          } 2>&1 | tee ci-results/artifact-inspection.txt
+          ditto -c -k --keepParent CoreUltraGraphics.kext ci-results/CoreUltraGraphics-diagnostic.zip
+          cp docs/BUILD_AND_TEST.md ci-results/BUILD_AND_TEST.md
+      - name: Retain logs and successful artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreUltraGraphics-diagnostic-${{ github.sha }}
+          path: ci-results/
+          if-no-files-found: error
+          retention-days: 14
